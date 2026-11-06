@@ -18,6 +18,9 @@ param(
     [string]$RenderDocVersion = "",
 
     [Parameter(Mandatory = $false)]
+    [string]$PackageName = "",
+
+    [Parameter(Mandatory = $false)]
     [string]$OutputRoot = "dist"
 )
 
@@ -28,7 +31,19 @@ if(-not $Version.StartsWith("v"))
     throw "Version must start with 'v'."
 }
 
-$packageName = "renderdoc-mcp-windows-x64-$Version"
+if([string]::IsNullOrWhiteSpace($PackageName))
+{
+    $packageName = "renderdoc-mcp-windows-x64-$Version"
+}
+else
+{
+    $packageName = $PackageName.Trim()
+
+    if($packageName -match '[\\/:*?"<>|]')
+    {
+        throw "PackageName contains characters that are not valid in a file name: $packageName"
+    }
+}
 $packageDir = Join-Path $OutputRoot $packageName
 $archivePath = Join-Path $OutputRoot "$packageName.zip"
 $hashPath = Join-Path $OutputRoot "$packageName.sha256"

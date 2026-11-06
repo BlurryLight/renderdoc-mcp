@@ -1,0 +1,379 @@
+name: Release (latest RenderDoc)
+
+# Builds renderdoc-mcp against the newest upstream RenderDoc release and publishes
+# a GitHub release named:
+#
+#   renderdoc-mcp-<mcp_version>-<renderdoc_version>
+#
+# Every RenderDoc bump produces a new, uniquely named release, so the workflow can
+# run on a schedule without ever overwriting an existing artifact.
+
+on:
+  schedule:
+    # RenderDoc ships roughly every two months. Check weekly (Monday 03:23 UTC).
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      renderdoc_version:
+        description: "RenderDoc tag to build (e.g. v1.47). Leave empty to auto-detect the latest v1.x tag."
+        required: false
+        type: string
+      mcp_version:
+        description: "renderdoc-mcp version (e.g. v0.3.1). Leave empty to use the latest vX.Y.Z git tag."
+        required: false
+        type: string
+      force:
+        description: "Rebuild even if a release with the same tag already exists"
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: "Publish the GitHub release as a draft"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-latest-renderdoc
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve versions
+    runs-on: windows-latest
+    outputs:
+      renderdoc_version: ${{ steps.versions.outputs.renderdoc_version }}
+      renderdoc_number: ${{ steps.versions.outputs.renderdoc_number }}
+      mcp_version: ${{ steps.versions.outputs.mcp_version }}
+      mcp_number: ${{ steps.versions.outputs.mcp_number }}
+      release_tag: ${{ steps.versions.outputs.release_tag }}
+      package_name: ${{ steps.versions.outputs.package_name }}
+      should_build: ${{ steps.versions.outputs.should_build }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve RenderDoc and renderdoc-mcp versions
+        id: versions
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RENDERDOC_VERSION: ${{ inputs.renderdoc_version }}
+          INPUT_MCP_VERSION: ${{ inputs.mcp_version }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+
+          function Get-LatestRenderDocTag {
+            # Avoid the GitHub API (rate limits); ask git for the tag list directly.
+            $raw = & git ls-remote --tags --refs https://github.com/baldurk/renderdoc.git "v1.*"
+            if ($LASTEXITCODE -ne 0) {
+              throw "git ls-remote against baldurk/renderdoc failed with exit code $LASTEXITCODE"
+            }
+
+            $candidates = @($raw |
+              ForEach-Object { ($_ -split "`t")[-1] -replace "^refs/tags/", "" } |
+              Where-Object { $_ -match "^v1\.\d+$" } |
+              ForEach-Object { [pscustomobject]@{ Tag = $_; Ver = [version]($_.TrimStart("v") + ".0") } } |
+              Sort-Object -Property Ver)
+
+            if ($candidates.Count -eq 0) {
+              throw "Could not find any RenderDoc tags matching v1.<minor>"
+            }
+
+            return $candidates[-1].Tag
+          }
+
+          function Get-LatestMcpTag {
+            $raw = & git ls-remote --tags --refs origin
+            if ($LASTEXITCODE -eq 0) {
+              $tags = @($raw |
+                ForEach-Object { ($_ -split "`t")[-1] -replace "^refs/tags/", "" } |
+                Where-Object { $_ -match "^v\d+\.\d+\.\d+$" } |
+                ForEach-Object { [pscustomobject]@{ Tag = $_; Ver = [version]($_.TrimStart("v")) } } |
+                Sort-Object -Property Ver)
+
+              if ($tags.Count -gt 0) {
+                return $tags[-1].Tag
+              }
+            }
+
+            # Fallback for forks without tags: highest release-notes/vX.Y.Z.md.
+            $notes = @(Get-ChildItem -LiteralPath "release-notes" -Filter "v*.md" -ErrorAction SilentlyContinue |
+              Where-Object { $_.BaseName -match "^v\d+\.\d+\.\d+$" } |
+              ForEach-Object { [pscustomobject]@{ Tag = $_.BaseName; Ver = [version]($_.BaseName.TrimStart("v")) } } |
+              Sort-Object -Property Ver)
+
+            if ($notes.Count -gt 0) {
+              return $notes[-1].Tag
+            }
+
+            return "v0.0.0"
+          }
+
+          $rdoc = "$env:INPUT_RENDERDOC_VERSION".Trim()
+          if (-not $rdoc) {
+            $rdoc = Get-LatestRenderDocTag
+            Write-Host "Auto-detected latest RenderDoc tag: $rdoc"
+          }
+
+          if ($rdoc -notmatch "^v1\.\d+$") {
+            throw "RenderDoc version must look like v1.<minor>, got '$rdoc'"
+          }
+
+          $mcp = "$env:INPUT_MCP_VERSION".Trim()
+          if (-not $mcp) {
+            $mcp = Get-LatestMcpTag
+            Write-Host "Auto-detected renderdoc-mcp version: $mcp"
+          }
+
+          if ($mcp -notmatch "^v\d+\.\d+\.\d+$") {
+            throw "renderdoc-mcp version must look like vX.Y.Z, got '$mcp'"
+          }
+
+          $rdocNumber = $rdoc.TrimStart("v")
+          $mcpNumber = $mcp.TrimStart("v")
+          $releaseTag = "$mcp-rdoc$rdocNumber"
+          $packageName = "renderdoc-mcp-$mcpNumber-$rdocNumber"
+
+          $force = "$env:INPUT_FORCE".Trim() -eq "true"
+
+          $exists = $false
+          & gh release view $releaseTag --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            $exists = $true
+          } else {
+            $remoteTags = & git ls-remote --tags --refs origin "refs/tags/$releaseTag"
+            if ($LASTEXITCODE -eq 0 -and "$remoteTags".Trim()) {
+              $exists = $true
+            }
+          }
+
+          $shouldBuild = -not $exists -or $force
+
+          if ($exists -and -not $force) {
+            Write-Host "Release $releaseTag already exists - nothing to do (use force=true to rebuild)."
+          }
+
+          "renderdoc_version=$rdoc" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "renderdoc_number=$rdocNumber" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "mcp_version=$mcp" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "mcp_number=$mcpNumber" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "release_tag=$releaseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "package_name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "should_build=$($shouldBuild.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          @(
+            "### Version resolution",
+            "",
+            "| Field | Value |",
+            "| --- | --- |",
+            "| RenderDoc | ``$rdoc`` |",
+            "| renderdoc-mcp | ``$mcp`` |",
+            "| Release tag | ``$releaseTag`` |",
+            "| Package name | ``$packageName`` |",
+            "| Already released | ``$exists`` |",
+            "| Will build | ``$shouldBuild`` |"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+  build:
+    name: Build and publish
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      RENDERDOC_VERSION: ${{ needs.resolve.outputs.renderdoc_version }}
+      RENDERDOC_NUMBER: ${{ needs.resolve.outputs.renderdoc_number }}
+      MCP_VERSION: ${{ needs.resolve.outputs.mcp_version }}
+      MCP_NUMBER: ${{ needs.resolve.outputs.mcp_number }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+      PACKAGE_NAME: ${{ needs.resolve.outputs.package_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Show versions
+        shell: pwsh
+        run: |
+          Write-Host "RenderDoc      : $env:RENDERDOC_VERSION"
+          Write-Host "renderdoc-mcp  : $env:MCP_VERSION"
+          Write-Host "Release tag    : $env:RELEASE_TAG"
+          Write-Host "Package name   : $env:PACKAGE_NAME"
+
+      # The RenderDoc build is the expensive part (~40 min on a cold runner).
+      # Cache the whole tree per RenderDoc version so only new versions pay for it.
+      - name: Cache RenderDoc source and build
+        id: cache-renderdoc
+        uses: actions/cache@v4
+        with:
+          path: renderdoc-src
+          key: renderdoc-${{ needs.resolve.outputs.renderdoc_version }}-${{ runner.os }}-msbuild-v2
+
+      - name: Clone RenderDoc
+        if: steps.cache-renderdoc.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch "$env:RENDERDOC_VERSION" https://github.com/baldurk/renderdoc.git renderdoc-src
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to clone RenderDoc $env:RENDERDOC_VERSION"
+          }
+          & git -C renderdoc-src rev-parse HEAD
+
+      - name: Build RenderDoc with MSBuild
+        if: steps.cache-renderdoc.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSPATH=%%i
+          if not defined VSPATH (
+            echo Could not locate a Visual Studio installation with the C++ toolset. 1>&2
+            exit /b 1
+          )
+          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+          msbuild renderdoc-src\renderdoc\3rdparty\breakpad\client\windows\common.vcxproj /p:Configuration=Development /p:Platform=x64 /p:PlatformToolset=v143 /p:SolutionDir=%CD%\renderdoc-src\ /m
+          if errorlevel 1 exit /b 1
+          msbuild renderdoc-src\renderdoc\3rdparty\breakpad\client\windows\crash_generation\crash_generation_client.vcxproj /p:Configuration=Development /p:Platform=x64 /p:PlatformToolset=v143 /p:SolutionDir=%CD%\renderdoc-src\ /m
+          if errorlevel 1 exit /b 1
+          msbuild renderdoc-src\renderdoc\3rdparty\breakpad\client\windows\handler\exception_handler.vcxproj /p:Configuration=Development /p:Platform=x64 /p:PlatformToolset=v143 /p:SolutionDir=%CD%\renderdoc-src\ /m
+          if errorlevel 1 exit /b 1
+          msbuild renderdoc-src\renderdoc\renderdoc.vcxproj /p:Configuration=Development /p:Platform=x64 /p:PlatformToolset=v143 /p:SolutionDir=%CD%\renderdoc-src\ /m
+          if errorlevel 1 exit /b 1
+
+      - name: Configure renderdoc-mcp
+        run: >
+          cmake -B build
+          -DRENDERDOC_DIR=renderdoc-src
+          -DRENDERDOC_BUILD_DIR=renderdoc-src/x64/Development
+
+      - name: Build renderdoc-mcp
+        run: cmake --build build --config Release --target renderdoc-mcp renderdoc-cli
+
+      - name: Smoke test executable
+        shell: pwsh
+        run: .\scripts\smoke-test.ps1 -ExePath build\Release\renderdoc-mcp.exe
+
+      - name: Package release archive
+        id: package
+        shell: pwsh
+        run: >
+          .\scripts\package-release.ps1
+          -Version $env:MCP_VERSION
+          -PackageName $env:PACKAGE_NAME
+          -BuildRoot build
+          -BuildDir build\Release
+          -RenderDocBuildDir renderdoc-src\x64\Development
+          -RenderDocRoot renderdoc-src
+          -RenderDocVersion $env:RENDERDOC_VERSION
+          -OutputRoot dist
+
+      - name: Validate release archive contents
+        shell: pwsh
+        run: |
+          $extractDir = Join-Path "dist" "package-check"
+          if (Test-Path $extractDir) {
+            Remove-Item -Recurse -Force $extractDir
+          }
+          Expand-Archive -Path "${{ steps.package.outputs.archive_path }}" -DestinationPath $extractDir
+          .\scripts\validate-release-package.ps1 `
+            -PackageDir (Join-Path $extractDir "$env:PACKAGE_NAME") `
+            -ExpectedRenderDocVersion "$env:RENDERDOC_VERSION"
+
+      - name: Prepare release notes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+
+          $notesPath = Join-Path "release-notes" "$env:RELEASE_TAG.md"
+          if (Test-Path $notesPath) {
+            Copy-Item $notesPath dist\release-notes.md
+            Write-Host "Using checked-in release notes from $notesPath"
+            return
+          }
+
+          $lines = @(
+            "Windows x64 build of **renderdoc-mcp $env:MCP_NUMBER**, compiled and packaged against **RenderDoc $env:RENDERDOC_NUMBER**.",
+            "",
+            "## Contents",
+            "",
+            "- ``bin/renderdoc-mcp.exe`` - MCP server (stdio)",
+            "- ``bin/renderdoc-cli.exe`` - one-shot CLI for shell and CI",
+            "- ``bin/renderdoc.dll`` / ``bin/renderdoc.json`` - bundled RenderDoc $env:RENDERDOC_NUMBER runtime (Vulkan layer manifest included)",
+            "- ``skills/renderdoc-mcp/`` - Codex workflow skill",
+            "- ``install-codex.ps1`` - one-click Codex installer",
+            "- license and third-party notice files",
+            "",
+            "## Capture compatibility",
+            "",
+            "This package bundles RenderDoc $env:RENDERDOC_NUMBER. It opens captures produced by RenderDoc $env:RENDERDOC_NUMBER or older.",
+            "Captures produced by a *newer* RenderDoc may fail to replay with ``APIIncompatibleVersion`` - rebuild against that version instead.",
+            "",
+            "## Notes",
+            "",
+            "- RenderDoc release: https://github.com/baldurk/renderdoc/releases/tag/$env:RENDERDOC_VERSION",
+            "- Release tag: ``$env:RELEASE_TAG``",
+            "- Built from commit $env:GITHUB_SHA.",
+            "- Install: unzip, keep the directory layout intact, then run ``install-codex.ps1``."
+          )
+
+          $lines | Set-Content -Path dist\release-notes.md -Encoding utf8
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.resolve.outputs.package_name }}
+          path: |
+            ${{ steps.package.outputs.archive_path }}
+            ${{ steps.package.outputs.hash_path }}
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ARCHIVE: ${{ steps.package.outputs.archive_path }}
+          RELEASE_HASH: ${{ steps.package.outputs.hash_path }}
+          IS_DRAFT: ${{ inputs.draft }}
+        run: |
+          $args = @(
+            "release", "create", $env:RELEASE_TAG,
+            $env:RELEASE_ARCHIVE,
+            $env:RELEASE_HASH,
+            "--title", "renderdoc-mcp $env:MCP_NUMBER (RenderDoc $env:RENDERDOC_NUMBER)",
+            "--notes-file", "dist\release-notes.md",
+            "--target", $env:GITHUB_SHA
+          )
+
+          if ("$env:IS_DRAFT".Trim() -eq "true") {
+            $args += "--draft"
+          }
+          else {
+            $args += "--latest"
+          }
+
+          gh @args
+          if ($LASTEXITCODE -ne 0) {
+            throw "gh release create failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Job summary
+        if: always()
+        shell: pwsh
+        run: |
+          @(
+            "### Release build",
+            "",
+            "| Field | Value |",
+            "| --- | --- |",
+            "| RenderDoc | ``$env:RENDERDOC_VERSION`` |",
+            "| renderdoc-mcp | ``$env:MCP_VERSION`` |",
+            "| Tag | ``$env:RELEASE_TAG`` |",
+            "| Package | ``$env:PACKAGE_NAME`` |"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
