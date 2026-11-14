@@ -57,6 +57,7 @@ jobs:
       release_tag: ${{ steps.versions.outputs.release_tag }}
       package_name: ${{ steps.versions.outputs.package_name }}
       should_build: ${{ steps.versions.outputs.should_build }}
+      is_newest: ${{ steps.versions.outputs.is_newest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -166,6 +167,19 @@ jobs:
             Write-Host "Release $releaseTag already exists - nothing to do (use force=true to rebuild)."
           }
 
+          # Only the newest RenderDoc build may carry the "Latest" badge; a
+          # dispatch for an older version (backfill) must not steal it from the
+          # release that already holds it.
+          $isNewest = $false
+          try {
+            $newestRdoc = Get-LatestRenderDocTag
+            $isNewest = ($rdoc -eq $newestRdoc)
+            Write-Host "Newest upstream RenderDoc tag: $newestRdoc (this build is newest: $isNewest)"
+          }
+          catch {
+            Write-Host "Could not resolve the newest RenderDoc tag ($_); not claiming the Latest badge."
+          }
+
           "renderdoc_version=$rdoc" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "renderdoc_number=$rdocNumber" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "mcp_version=$mcp" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -173,6 +187,7 @@ jobs:
           "release_tag=$releaseTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "package_name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "should_build=$($shouldBuild.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "is_newest=$($isNewest.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
           @(
             "### Version resolution",
@@ -184,7 +199,8 @@ jobs:
             "| Release tag | ``$releaseTag`` |",
             "| Package name | ``$packageName`` |",
             "| Already released | ``$exists`` |",
-            "| Will build | ``$shouldBuild`` |"
+            "| Will build | ``$shouldBuild`` |",
+            "| Claims Latest badge | ``$isNewest`` |"
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
   build:
@@ -200,6 +216,7 @@ jobs:
       MCP_NUMBER: ${{ needs.resolve.outputs.mcp_number }}
       RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
       PACKAGE_NAME: ${{ needs.resolve.outputs.package_name }}
+      IS_NEWEST: ${{ needs.resolve.outputs.is_newest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -359,8 +376,13 @@ jobs:
           if ("$env:IS_DRAFT".Trim() -eq "true") {
             $args += "--draft"
           }
-          else {
+          elseif ("$env:IS_NEWEST".Trim() -eq "true") {
             $args += "--latest"
+          }
+          else {
+            # Backfill of an older RenderDoc: publish without touching the
+            # repository's "Latest" pointer.
+            $args += "--latest=false"
           }
 
           gh @args
