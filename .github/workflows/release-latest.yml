@@ -36,8 +36,13 @@ on:
 permissions:
   contents: write
 
+# Key the concurrency group by RenderDoc version so that dispatches for
+# different versions can build in parallel. A single fixed group would let each
+# new dispatch cancel the previously *pending* run, so a batch of per-version
+# dispatches would only ever build the first and the last one. Runs for the same
+# version stay serialised (queued, never cancelled mid-build).
 concurrency:
-  group: release-latest-renderdoc
+  group: release-latest-renderdoc-${{ inputs.renderdoc_version || 'auto' }}
   cancel-in-progress: false
 
 jobs:
