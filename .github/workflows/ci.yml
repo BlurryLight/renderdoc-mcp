@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   unit-tests:
@@ -33,21 +34,37 @@ jobs:
         with:
           path: |
             renderdoc-src
-          key: renderdoc-v1.36-${{ runner.os }}-msbuild-v3
+          key: renderdoc-v1.36-${{ runner.os }}-msbuild-v4
 
       - name: Clone renderdoc
         if: steps.cache-renderdoc.outputs.cache-hit != 'true'
         run: git clone --depth 1 --branch v1.36 https://github.com/baldurk/renderdoc.git renderdoc-src
 
+      # Locate Visual Studio through vswhere instead of a hard-coded edition path:
+      # `windows-latest` moved to the windows-2025-vs2026 image, where VS lives under
+      # `Visual Studio\18\Enterprise` and the old `...\2022\Enterprise\...` path
+      # (used below until v0.3.2) no longer exists -- which silently left `msbuild`
+      # off PATH. The build step always runs: `renderdoc-src` is what gets cached,
+      # and an incremental MSBuild over an up-to-date tree is cheap, while a
+      # source-only cache must still be built.
       - name: Build renderdoc with MSBuild
-        if: steps.cache-renderdoc.outputs.cache-hit != 'true'
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSPATH=%%i
+          if not defined VSPATH (
+            echo Could not locate a Visual Studio installation with the C++ toolset. 1>&2
+            exit /b 1
+          )
+          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
           msbuild renderdoc-src\renderdoc\3rdparty\breakpad\client\windows\common.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:SolutionDir=%CD%\renderdoc-src\ /m
+          if errorlevel 1 exit /b 1
           msbuild renderdoc-src\renderdoc\3rdparty\breakpad\client\windows\crash_generation\crash_generation_client.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:SolutionDir=%CD%\renderdoc-src\ /m
+          if errorlevel 1 exit /b 1
           msbuild renderdoc-src\renderdoc\3rdparty\breakpad\client\windows\handler\exception_handler.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:SolutionDir=%CD%\renderdoc-src\ /m
+          if errorlevel 1 exit /b 1
           msbuild renderdoc-src\renderdoc\renderdoc.vcxproj /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:SolutionDir=%CD%\renderdoc-src\ /m
+          if errorlevel 1 exit /b 1
 
       - name: Configure CMake
         run: >
