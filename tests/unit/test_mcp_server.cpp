@@ -65,7 +65,8 @@ TEST_F(McpServerTest, Initialize_ReturnsServerInfo)
     auto resp = m_server->handleMessage(makeRequest("initialize"));
     ASSERT_TRUE(resp.contains("result"));
     EXPECT_EQ(resp["result"]["serverInfo"]["name"], "renderdoc-mcp");
-    EXPECT_EQ(resp["result"]["protocolVersion"], "2025-03-26");
+    // No protocolVersion requested -> advertise the latest revision we support.
+    EXPECT_EQ(resp["result"]["protocolVersion"], "2025-11-25");
 }
 
 TEST_F(McpServerTest, Initialize_HasToolsCapability)
@@ -228,12 +229,32 @@ TEST_F(McpServerTest, Shutdown_ReturnsEmptyResult)
     EXPECT_TRUE(resp["result"].is_object());
 }
 
-TEST_F(McpServerTest, Initialize_UnsupportedProtocolVersion_ReturnsError)
+TEST_F(McpServerTest, Initialize_UnsupportedProtocolVersion_NegotiatesLatest)
 {
+    // Per the MCP lifecycle spec a version we do not support must NOT be a hard
+    // error: we answer with the latest revision we do support and let the client
+    // decide whether to continue.
     auto resp = m_server->handleMessage(makeRequest("initialize",
         {{"protocolVersion", "9999-01-01"}}));
-    ASSERT_TRUE(resp.contains("error"));
-    EXPECT_EQ(resp["error"]["code"], -32602);
+    ASSERT_TRUE(resp.contains("result"));
+    EXPECT_EQ(resp["result"]["protocolVersion"], "2025-11-25");
+}
+
+TEST_F(McpServerTest, Initialize_LatestClientVersion_IsEchoed)
+{
+    // opencode (>= 1.18) sends 2025-11-25 and would otherwise fail to connect.
+    auto resp = m_server->handleMessage(makeRequest("initialize",
+        {{"protocolVersion", "2025-11-25"}}));
+    ASSERT_TRUE(resp.contains("result"));
+    EXPECT_EQ(resp["result"]["protocolVersion"], "2025-11-25");
+}
+
+TEST_F(McpServerTest, Initialize_IntermediateClientVersion_IsEchoed)
+{
+    auto resp = m_server->handleMessage(makeRequest("initialize",
+        {{"protocolVersion", "2025-06-18"}}));
+    ASSERT_TRUE(resp.contains("result"));
+    EXPECT_EQ(resp["result"]["protocolVersion"], "2025-06-18");
 }
 
 TEST_F(McpServerTest, Initialize_MatchingProtocolVersion_Succeeds)

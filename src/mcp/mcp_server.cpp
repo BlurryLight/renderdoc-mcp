@@ -3,7 +3,10 @@
 #include "core/session.h"
 #include "core/diff_session.h"
 #include "core/errors.h"
+#include <algorithm>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 using json = nlohmann::json;
 
@@ -141,24 +144,48 @@ json McpServer::handleBatch(const json& arr)
 
 // ── MCP method handlers ─────────────────────────────────────────────────────
 
+namespace {
+
+// Protocol revisions this server can serve. Newer revisions of MCP only add
+// optional capabilities (structured tool output, elicitation, tasks, ...), so a
+// tools-only server stays wire-compatible with all of them. Order matters:
+// front() is the latest revision we advertise.
+const std::vector<std::string> kSupportedProtocolVersions = {
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+};
+
+bool isSupportedProtocolVersion(const std::string& version)
+{
+    return std::find(kSupportedProtocolVersions.begin(), kSupportedProtocolVersions.end(),
+                     version) != kSupportedProtocolVersions.end();
+}
+
+} // namespace
+
 json McpServer::handleInitialize(const json& msg)
 {
     json id = msg.value("id", json(nullptr));
-
-    // Validate client protocol version for compatibility
-    static constexpr const char* kSupportedProtocolVersion = "2025-03-26";
     json params = msg.value("params", json::object());
-    if (params.contains("protocolVersion")) {
-        std::string clientVersion = params["protocolVersion"].get<std::string>();
-        if (clientVersion != kSupportedProtocolVersion) {
-            return makeError(id, -32602,
-                "Unsupported protocol version: " + clientVersion +
-                " (server supports " + kSupportedProtocolVersion + ")");
+
+    // Version negotiation (MCP lifecycle spec): if the requested revision is one
+    // we support, echo it back; otherwise answer with the latest revision we
+    // support and let the client decide whether it can continue. Rejecting the
+    // request with an error instead violates the spec and breaks clients that
+    // would happily run on an older revision -- e.g. opencode sends
+    // "2025-11-25" and accepts a "2025-03-26" answer.
+    const std::string& latest = kSupportedProtocolVersions.front();
+    std::string negotiated = latest;
+    if (params.contains("protocolVersion") && params["protocolVersion"].is_string()) {
+        const std::string clientVersion = params["protocolVersion"].get<std::string>();
+        if (isSupportedProtocolVersion(clientVersion)) {
+            negotiated = clientVersion;
         }
     }
 
     json result;
-    result["protocolVersion"] = kSupportedProtocolVersion;
+    result["protocolVersion"] = negotiated;
     result["capabilities"]["tools"] = json::object();
     result["serverInfo"]["name"] = "renderdoc-mcp";
     result["serverInfo"]["version"] = "1.0.0";
